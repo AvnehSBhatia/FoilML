@@ -13,7 +13,43 @@
         <header>
             <h1>Interactive Airfoil Design Tool</h1>
             <p class="subtitle">Design custom airfoils using neural networks</p>
+            <nav style="margin-top: 20px; display: flex; gap: 10px; justify-content: center;">
+                <a href="/hof" class="btn btn-secondary" style="text-decoration: none;">Hall of Fame</a>
+                <button class="btn btn-secondary" onclick="toggleSettings()" id="settings-btn">Settings</button>
+            </nav>
         </header>
+
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="modal" style="display: none;">
+            <div class="modal-content" style="max-width: 600px;">
+                <span class="modal-close" onclick="closeSettings()">&times;</span>
+                <h2>Settings</h2>
+                <div class="settings-section">
+                    <h3>Custom Colors</h3>
+                    <div class="color-input-group">
+                        <label>Primary Color:</label>
+                        <input type="color" id="color-primary" value="#2563eb" onchange="updateColors()">
+                    </div>
+                    <div class="color-input-group">
+                        <label>Success Color:</label>
+                        <input type="color" id="color-success" value="#10b981" onchange="updateColors()">
+                    </div>
+                    <div class="color-input-group">
+                        <label>Secondary Color:</label>
+                        <input type="color" id="color-secondary" value="#6b7280" onchange="updateColors()">
+                    </div>
+                    <div class="color-input-group">
+                        <label>Background:</label>
+                        <input type="color" id="color-background" value="#f9fafb" onchange="updateColors()">
+                    </div>
+                    <div class="color-input-group">
+                        <label>Card Background:</label>
+                        <input type="color" id="color-card" value="#ffffff" onchange="updateColors()">
+                    </div>
+                    <button class="btn btn-secondary" onclick="resetColors()" style="margin-top: 10px;">Reset to Default</button>
+                </div>
+            </div>
+        </div>
 
         <div class="main-content">
             <!-- Step 1: Flight Conditions -->
@@ -107,14 +143,26 @@
             <!-- Step 6: Generate -->
             <section class="card" id="step6">
                 <h2>6. Generate Airfoil</h2>
-                <button class="btn btn-success btn-large" onclick="generateAirfoil()" id="generate-btn">
-                    Generate Airfoil
-                </button>
+                <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+                    <button class="btn btn-success btn-large" onclick="generateAirfoil()" id="generate-btn" style="flex: 1;">
+                        Generate Airfoil
+                    </button>
+                    <button class="btn btn-secondary" onclick="exportConfig()" id="export-btn">
+                        Export Config
+                    </button>
+                    <button class="btn btn-secondary" onclick="document.getElementById('import-file').click()" id="import-btn">
+                        Import Config
+                    </button>
+                    <input type="file" id="import-file" accept=".json" style="display: none;" onchange="importConfig(event)">
+                </div>
                 <div id="optimization-status" style="display: none;">
                     <div class="progress-container">
                         <div class="progress-header">
                             <h3>Optimizing Airfoil</h3>
-                            <span id="progress-text">0%</span>
+                            <div style="display: flex; gap: 10px; align-items: center;">
+                                <span id="progress-text">0%</span>
+                                <button class="btn btn-sm" onclick="cancelOptimization()" id="cancel-btn">Cancel</button>
+                            </div>
                         </div>
                         <div class="progress-bar">
                             <div class="progress-fill" id="progress-fill"></div>

@@ -41,11 +41,38 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'output'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
+# Hall of Fame storage path (use /data mount from Fly.io volume if available, otherwise local)
+# The /data directory is mounted from the "gallery" Fly.io volume as configured in fly.toml
+HOF_DATA_DIR = '/data' if os.path.exists('/data') else 'hof_data'
+HOF_DB_FILE = os.path.join(HOF_DATA_DIR, 'hall_of_fame.json')
+try:
+    os.makedirs(HOF_DATA_DIR, exist_ok=True)
+    # Test write access
+    test_file = os.path.join(HOF_DATA_DIR, '.test_write')
+    with open(test_file, 'w') as f:
+        f.write('test')
+    os.remove(test_file)
+    print(f"Hall of Fame storage initialized at: {HOF_DATA_DIR}")
+except Exception as e:
+    print(f"Warning: Could not initialize HOF storage at {HOF_DATA_DIR}: {e}")
+    # Fallback to local storage
+    HOF_DATA_DIR = 'hof_data'
+    HOF_DB_FILE = os.path.join(HOF_DATA_DIR, 'hall_of_fame.json')
+    os.makedirs(HOF_DATA_DIR, exist_ok=True)
+    print(f"Using fallback storage at: {HOF_DATA_DIR}")
+
 # Global model variables (loaded once on startup)
 aero_model = None
 af512_to_xy_model = None
 normalization_data = None
 device = None
+
+# Hall of Fame bins
+RE_BINS = [50000, 100000, 250000, 500000, 750000, 1000000]
+MAX_HOF_ENTRIES = 10  # Top 10 per category
+
+# Optimization cancellation tracking
+optimization_cancelled = {}  # Track cancelled optimizations by request ID
 
 def load_models():
     """Load models once at startup."""
@@ -139,10 +166,216 @@ except Exception as e:
     print(f"Error loading models: {e}")
     print("Server will start but predictions won't work until models are available.")
 
+# Hall of Fame functions
+def load_hof_database():
+    """Load Hall of Fame database from JSON file."""
+    if os.path.exists(HOF_DB_FILE):
+        try:
+            with open(HOF_DB_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading HOF database: {e}")
+            return {}
+    return {}
+
+def save_hof_database(hof_db):
+    """Save Hall of Fame database to JSON file."""
+    try:
+        with open(HOF_DB_FILE, 'w') as f:
+            json.dump(hof_db, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error saving HOF database: {e}")
+        return False
+
+def initialize_hof_structure():
+    """Initialize HOF database structure if it doesn't exist."""
+    hof_db = load_hof_database()
+    if not hof_db:
+        hof_db = {}
+        for re_bin in RE_BINS:
+            hof_db[str(re_bin)] = {
+                'peak_ld': [],  # List of top L/D entries
+                'peak_cl': []   # List of top Cl entries
+            }
+        save_hof_database(hof_db)
+    else:
+        # Ensure all bins exist
+        updated = False
+        for re_bin in RE_BINS:
+            if str(re_bin) not in hof_db:
+                hof_db[str(re_bin)] = {'peak_ld': [], 'peak_cl': []}
+                updated = True
+        if updated:
+            save_hof_database(hof_db)
+    return hof_db
+
+def check_hof_eligibility(re_bin, stats, hof_db=None):
+    """
+    Check if an airfoil qualifies for Hall of Fame.
+    
+    Args:
+        re_bin: Binned Reynolds number
+        stats: Dictionary with 'ldmax' and 'clmax' keys
+        hof_db: Optional HOF database (will load if not provided)
+    
+    Returns:
+        Tuple (qualifies_ld, qualifies_cl) - boolean flags
+    """
+    if hof_db is None:
+        hof_db = load_hof_database()
+    
+    re_bin_str = str(re_bin)
+    if re_bin_str not in hof_db:
+        return True, True  # Empty category, always qualifies
+    
+    ld_entries = hof_db[re_bin_str].get('peak_ld', [])
+    cl_entries = hof_db[re_bin_str].get('peak_cl', [])
+    
+    # Check if qualifies for peak L/D
+    qualifies_ld = True
+    if len(ld_entries) >= MAX_HOF_ENTRIES:
+        # Check if this L/D is better than the worst in top 10
+        worst_ld = min(entry['ldmax'] for entry in ld_entries)
+        qualifies_ld = stats['ldmax'] > worst_ld
+    
+    # Check if qualifies for peak Cl
+    qualifies_cl = True
+    if len(cl_entries) >= MAX_HOF_ENTRIES:
+        # Check if this Cl is better than the worst in top 10
+        worst_cl = min(entry['clmax'] for entry in cl_entries)
+        qualifies_cl = stats['clmax'] > worst_cl
+    
+    return qualifies_ld, qualifies_cl
+
+def add_to_hof(re_bin, stats, x_coords, y_coords, airfoil_plot_b64, curves_plot_b64, 
+                alpha, nf_cl, nf_cd, nf_ld, min_thickness, max_thickness):
+    """
+    Add an airfoil to Hall of Fame if it qualifies.
+    
+    Args:
+        re_bin: Binned Reynolds number
+        stats: Dictionary with performance stats
+        x_coords, y_coords: Airfoil coordinates
+        airfoil_plot_b64, curves_plot_b64: Base64 encoded plots
+        alpha, nf_cl, nf_cd, nf_ld: Aerodynamic data
+        min_thickness, max_thickness: Thickness parameters
+    
+    Returns:
+        Tuple (added_ld, added_cl) - boolean flags indicating if added
+    """
+    hof_db = load_hof_database()
+    re_bin_str = str(re_bin)
+    
+    # Initialize structure if needed
+    if re_bin_str not in hof_db:
+        hof_db[re_bin_str] = {'peak_ld': [], 'peak_cl': []}
+    
+    # Check eligibility first
+    qualifies_ld, qualifies_cl = check_hof_eligibility(re_bin, stats, hof_db)
+    
+    if not qualifies_ld and not qualifies_cl:
+        return False, False  # Doesn't qualify for either
+    
+    # Create entry
+    entry = {
+        'ldmax': float(stats['ldmax']),
+        'clmax': float(stats['clmax']),
+        'cdmin': float(stats.get('cdmin', 0)),
+        'alpha_clmax': float(stats.get('alpha_clmax', 0)),
+        'alpha_cdmin': float(stats.get('alpha_cdmin', 0)),
+        'alpha_ldmax': float(stats.get('alpha_ldmax', 0)),
+        'x_coords': [float(x) for x in x_coords],
+        'y_coords': [float(y) for y in y_coords],
+        'airfoil_plot': airfoil_plot_b64,
+        'curves_plot': curves_plot_b64,
+        'alpha': [float(a) for a in alpha],
+        'nf_cl': [float(c) if not np.isnan(c) else None for c in nf_cl] if nf_cl is not None else None,
+        'nf_cd': [float(c) if not np.isnan(c) else None for c in nf_cd] if nf_cd is not None else None,
+        'nf_ld': [float(c) if not np.isnan(c) else None for c in nf_ld] if nf_ld is not None else None,
+        'min_thickness': float(min_thickness),
+        'max_thickness': float(max_thickness),
+        're_bin': int(re_bin)
+    }
+    
+    added_ld = False
+    added_cl = False
+    
+    # Add to peak L/D list if qualifies
+    if qualifies_ld:
+        ld_entries = hof_db[re_bin_str]['peak_ld'].copy()
+        ld_entries.append(entry)
+        ld_entries.sort(key=lambda x: x['ldmax'], reverse=True)
+        if len(ld_entries) > MAX_HOF_ENTRIES:
+            ld_entries = ld_entries[:MAX_HOF_ENTRIES]
+        
+        # Check if our entry is in the top MAX_HOF_ENTRIES
+        if any(abs(e['ldmax'] - entry['ldmax']) < 1e-6 for e in ld_entries):
+            hof_db[re_bin_str]['peak_ld'] = ld_entries
+            added_ld = True
+    
+    # Add to peak Cl list if qualifies
+    if qualifies_cl:
+        cl_entries = hof_db[re_bin_str]['peak_cl'].copy()
+        cl_entries.append(entry)
+        cl_entries.sort(key=lambda x: x['clmax'], reverse=True)
+        if len(cl_entries) > MAX_HOF_ENTRIES:
+            cl_entries = cl_entries[:MAX_HOF_ENTRIES]
+        
+        # Check if our entry is in the top MAX_HOF_ENTRIES
+        if any(abs(e['clmax'] - entry['clmax']) < 1e-6 for e in cl_entries):
+            hof_db[re_bin_str]['peak_cl'] = cl_entries
+            added_cl = True
+    
+    # Save database if anything was added
+    if added_ld or added_cl:
+        save_hof_database(hof_db)
+    
+    return added_ld, added_cl
+
+# Initialize HOF database on startup
+initialize_hof_structure()
+
+def scale_dat_coordinates(x_coords, y_coords):
+    """
+    Scale coordinates so that x extremes are -1 and 1.
+    This normalizes the airfoil to a standard chord length.
+    
+    Args:
+        x_coords: Array of x coordinates
+        y_coords: Array of y coordinates
+    
+    Returns:
+        Tuple of (scaled_x_coords, scaled_y_coords)
+    """
+    x_coords = np.array(x_coords)
+    y_coords = np.array(y_coords)
+    
+    x_min = np.min(x_coords)
+    x_max = np.max(x_coords)
+    x_range = x_max - x_min
+    
+    if x_range < 1e-10:  # Avoid division by zero
+        return x_coords, y_coords
+    
+    # Scale x to [-1, 1] range
+    # Linear transformation: new_x = -1 + 2 * (x - x_min) / (x_max - x_min)
+    scaled_x = -1 + 2 * (x_coords - x_min) / x_range
+    
+    # Scale y proportionally to maintain aspect ratio
+    scaled_y = y_coords * (2 / x_range)
+    
+    return scaled_x, scaled_y
+
 @app.route('/')
 def index():
     """Render the main page."""
     return render_template('index.html')
+
+@app.route('/hof')
+def hof():
+    """Render the Hall of Fame page."""
+    return render_template('hof.html')
 
 @app.route('/api/compute_reynolds', methods=['POST'])
 def api_compute_reynolds():
@@ -391,11 +624,12 @@ def api_generate_airfoil():
         curves_plot_b64 = base64.b64encode(img_buf.read()).decode()
         plt.close()
         
-        # Save .dat file
+        # Save .dat file with scaled coordinates
         dat_path = os.path.join('output', 'generated_airfoil.dat')
+        scaled_x, scaled_y = scale_dat_coordinates(pred_x, pred_y)
         with open(dat_path, 'w') as f:
             f.write("Generated Airfoil\n")
-            for x, y in zip(pred_x, pred_y):
+            for x, y in zip(scaled_x, scaled_y):
                 f.write(f"{x:.6f} {y:.6f}\n")
         
         # Use NeuralFoil stats if available, otherwise fall back to user input stats
@@ -541,9 +775,17 @@ def api_optimize_airfoil():
     if aero_model is None or af512_to_xy_model is None:
         return jsonify({'error': 'Models not loaded'}), 500
     
+    # Generate unique request ID for cancellation tracking
+    import uuid
+    request_id = str(uuid.uuid4())
+    optimization_cancelled[request_id] = False
+    
     @stream_with_context
     def generate():
         try:
+            # Send request ID as first message
+            yield f"data: {json.dumps({'type': 'init', 'request_id': request_id})}\n\n"
+            
             data = request.json
             
             # Extract inputs
@@ -584,6 +826,11 @@ def api_optimize_airfoil():
                 min_thicknesses = np.arange(0.01, max_t / 2 + 0.005, 0.01)
                 
                 for min_t in min_thicknesses:
+                    # Check for cancellation
+                    if optimization_cancelled.get(request_id, False):
+                        yield f"data: {json.dumps({'type': 'cancelled', 'message': 'Optimization cancelled by user'})}\n\n"
+                        return
+                    
                     current_iteration += 1
                     progress = (current_iteration / total_iterations) * 100
                     
@@ -680,23 +927,54 @@ def api_optimize_airfoil():
                         nf_ld_valid = best_nf_ld[valid_mask]
                         nf_stats = compute_summary_statistics(nf_alpha_valid, nf_cl_valid, nf_cd_valid, nf_ld_valid)
                 
-                # Save .dat file
+                # Save .dat file with scaled coordinates
                 os.makedirs('output', exist_ok=True)
                 dat_path = os.path.join('output', 'generated_airfoil.dat')
+                scaled_x, scaled_y = scale_dat_coordinates(best_pred_x, best_pred_y)
                 with open(dat_path, 'w') as f:
                     f.write("Generated Airfoil\n")
-                    for x, y in zip(best_pred_x, best_pred_y):
+                    for x, y in zip(scaled_x, scaled_y):
                         f.write(f"{x:.6f} {y:.6f}\n")
                 
+                # Check Hall of Fame eligibility
+                hof_qualifies_ld = False
+                hof_qualifies_cl = False
+                hof_added_ld = False
+                hof_added_cl = False
+                if nf_stats and NEURALFOIL_AVAILABLE:
+                    re_bin = bin_reynolds_number(Re)
+                    hof_qualifies_ld, hof_qualifies_cl = check_hof_eligibility(re_bin, nf_stats)
+                    
+                    if hof_qualifies_ld or hof_qualifies_cl:
+                        hof_added_ld, hof_added_cl = add_to_hof(
+                            re_bin, nf_stats, best_pred_x, best_pred_y,
+                            best_airfoil_plot, curves_plot_b64,
+                            alpha, best_nf_cl, best_nf_cd, best_nf_ld,
+                            best_min_t, best_max_t
+                        )
+                
                 # Send final result
-                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'x_coords': best_pred_x.tolist(), 'y_coords': best_pred_y.tolist(), 'stats': {k: float(v) for k, v in (nf_stats or {}).items()}, 'plots': {'airfoil_shape': best_airfoil_plot, 'aerodynamic_curves': curves_plot_b64}, 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t), 'best_error': float(best_error)})}\n\n"
+                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'x_coords': best_pred_x.tolist(), 'y_coords': best_pred_y.tolist(), 'stats': {k: float(v) for k, v in (nf_stats or {}).items()}, 'plots': {'airfoil_shape': best_airfoil_plot, 'aerodynamic_curves': curves_plot_b64}, 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t), 'best_error': float(best_error), 'hof_added_ld': hof_added_ld, 'hof_added_cl': hof_added_cl})}\n\n"
             else:
                 yield f"data: {json.dumps({'type': 'complete', 'success': False, 'error': 'No valid airfoil generated'})}\n\n"
         
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        finally:
+            # Clean up cancellation tracking
+            if request_id in optimization_cancelled:
+                del optimization_cancelled[request_id]
     
-    return Response(generate(), mimetype='text/event-stream')
+    return Response(generate(), mimetype='text/event-stream', headers={'X-Request-ID': request_id})
+
+@app.route('/api/cancel_optimization', methods=['POST'])
+def api_cancel_optimization():
+    """Cancel an ongoing optimization."""
+    request_id = request.headers.get('X-Request-ID') or request.json.get('request_id')
+    if request_id:
+        optimization_cancelled[request_id] = True
+        return jsonify({'success': True, 'message': 'Cancellation requested'})
+    return jsonify({'error': 'Request ID not provided'}), 400
 
 @app.route('/api/download_dat', methods=['GET'])
 def api_download_dat():
@@ -706,6 +984,132 @@ def api_download_dat():
         return send_file(dat_path, as_attachment=True, download_name='generated_airfoil.dat')
     else:
         return jsonify({'error': 'No airfoil file generated yet'}), 404
+
+@app.route('/api/export_config', methods=['GET', 'POST'])
+def api_export_config():
+    """Export flight conditions and curves as JSON."""
+    try:
+        data = request.json if request.method == 'POST' else request.args.to_dict()
+        
+        # Extract all configuration data
+        config = {
+            'chord_ft': float(data.get('chord_ft', 0)),
+            'speed_mph': float(data.get('speed_mph', 0)),
+            're': float(data.get('re', 0)),
+            'mach': float(data.get('mach', 0)),
+            'alpha_min': float(data.get('alpha_min', 0)),
+            'alpha_max': float(data.get('alpha_max', 0)),
+            'alpha': data.get('alpha', []),
+            'cl_points': data.get('cl_points', []),
+            'clcd_points': data.get('clcd_points', []),
+            'cl_interpolated': data.get('cl_interpolated', []),
+            'clcd_interpolated': data.get('clcd_interpolated', []),
+            'max_thickness_min': float(data.get('max_thickness_min', 0.1)),
+            'max_thickness_max': float(data.get('max_thickness_max', 0.2))
+        }
+        
+        # Create response with JSON download
+        response = jsonify(config)
+        response.headers['Content-Disposition'] = 'attachment; filename=airfoil_config.json'
+        return response
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/import_config', methods=['POST'])
+def api_import_config():
+    """Import flight conditions and curves from JSON."""
+    try:
+        if 'file' in request.files:
+            # File upload
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'error': 'No file selected'}), 400
+            config = json.load(file)
+        elif request.json:
+            # JSON data directly
+            config = request.json
+        else:
+            return jsonify({'error': 'No configuration data provided'}), 400
+        
+        # Validate and return config
+        validated_config = {
+            'chord_ft': float(config.get('chord_ft', 0)),
+            'speed_mph': float(config.get('speed_mph', 0)),
+            're': float(config.get('re', 0)),
+            'mach': float(config.get('mach', 0)),
+            'alpha_min': float(config.get('alpha_min', 0)),
+            'alpha_max': float(config.get('alpha_max', 0)),
+            'alpha': config.get('alpha', []),
+            'cl_points': config.get('cl_points', []),
+            'clcd_points': config.get('clcd_points', []),
+            'cl_interpolated': config.get('cl_interpolated', []),
+            'clcd_interpolated': config.get('clcd_interpolated', []),
+            'max_thickness_min': float(config.get('max_thickness_min', 0.1)),
+            'max_thickness_max': float(config.get('max_thickness_max', 0.2))
+        }
+        
+        return jsonify({'success': True, 'config': validated_config})
+    except Exception as e:
+        return jsonify({'error': f'Invalid configuration file: {str(e)}'}), 400
+
+@app.route('/api/hof', methods=['GET'])
+def api_get_hof():
+    """Get all Hall of Fame entries."""
+    hof_db = load_hof_database()
+    return jsonify(hof_db)
+
+@app.route('/api/hof/<int:re_bin>/<category>', methods=['GET'])
+def api_get_hof_category(re_bin, category):
+    """Get Hall of Fame entries for a specific Re bin and category (peak_ld or peak_cl)."""
+    if category not in ['peak_ld', 'peak_cl']:
+        return jsonify({'error': 'Invalid category. Use peak_ld or peak_cl'}), 400
+    
+    hof_db = load_hof_database()
+    re_bin_str = str(re_bin)
+    
+    if re_bin_str not in hof_db:
+        return jsonify([])
+    
+    entries = hof_db[re_bin_str].get(category, [])
+    return jsonify(entries)
+
+@app.route('/api/hof/download/<int:re_bin>/<category>/<int:index>', methods=['GET'])
+def api_download_hof_airfoil(re_bin, category, index):
+    """Download a Hall of Fame airfoil as .dat file."""
+    if category not in ['peak_ld', 'peak_cl']:
+        return jsonify({'error': 'Invalid category'}), 400
+    
+    hof_db = load_hof_database()
+    re_bin_str = str(re_bin)
+    
+    if re_bin_str not in hof_db:
+        return jsonify({'error': 'Re bin not found'}), 404
+    
+    entries = hof_db[re_bin_str].get(category, [])
+    if index < 0 or index >= len(entries):
+        return jsonify({'error': 'Index out of range'}), 404
+    
+    entry = entries[index]
+    
+    # Create .dat file content in memory with scaled coordinates
+    scaled_x, scaled_y = scale_dat_coordinates(entry['x_coords'], entry['y_coords'])
+    
+    # Create file content
+    file_content = f"Hall of Fame Airfoil - Re={re_bin}, {category.replace('_', ' ').title()}, Rank #{index+1}\n"
+    for x, y in zip(scaled_x, scaled_y):
+        file_content += f"{x:.6f} {y:.6f}\n"
+    
+    # Create BytesIO object and send directly
+    from io import BytesIO
+    file_buffer = BytesIO(file_content.encode('utf-8'))
+    file_buffer.seek(0)
+    
+    return send_file(
+        file_buffer,
+        mimetype='text/plain',
+        as_attachment=True,
+        download_name=f'hof_airfoil_{re_bin}_{category}_{index}.dat'
+    )
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8080)

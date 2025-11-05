@@ -303,7 +303,7 @@ header h1 {
 }
 
 .stat-card {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, var(--stat-card-1-start, #667eea) 0%, var(--stat-card-1-end, #764ba2) 100%);
     padding: 24px;
     border-radius: 12px;
     color: white;
@@ -311,11 +311,11 @@ header h1 {
 }
 
 .stat-card:nth-child(2) {
-    background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    background: linear-gradient(135deg, var(--stat-card-2-start, #f093fb) 0%, var(--stat-card-2-end, #f5576c) 100%);
 }
 
 .stat-card:nth-child(3) {
-    background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+    background: linear-gradient(135deg, var(--stat-card-3-start, #4facfe) 0%, var(--stat-card-3-end, #00f2fe) 100%);
 }
 
 .stat-label {
@@ -432,6 +432,157 @@ header h1 {
     color: var(--text-primary);
 }
 
+/* Hall of Fame Styles */
+.category-selector, .re-bin-selector {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.airfoil-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 20px;
+    margin-top: 20px;
+}
+
+.airfoil-card {
+    background: var(--card-background);
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-align: center;
+}
+
+.airfoil-card:hover {
+    border-color: var(--primary-color);
+    box-shadow: var(--shadow-lg);
+    transform: translateY(-2px);
+}
+
+.airfoil-rank {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--primary-color);
+    margin-bottom: 8px;
+}
+
+.airfoil-card img {
+    width: 100%;
+    height: auto;
+    border-radius: 4px;
+    margin-bottom: 8px;
+}
+
+.airfoil-card-stats {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.airfoil-card-stats strong {
+    color: var(--text-primary);
+}
+
+/* Modal Styles */
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.7);
+}
+
+.modal-content {
+    background-color: var(--card-background);
+    margin: 2% auto;
+    padding: 30px;
+    border-radius: 12px;
+    max-width: 900px;
+    width: 90%;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: var(--shadow-lg);
+    position: relative;
+}
+
+.modal-close {
+    position: absolute;
+    right: 20px;
+    top: 20px;
+    font-size: 2rem;
+    font-weight: bold;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+}
+
+.modal-close:hover {
+    color: var(--text-primary);
+}
+
+.detail-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+    margin-bottom: 30px;
+}
+
+.detail-params {
+    margin: 20px 0;
+    padding: 16px;
+    background: #f9fafb;
+    border-radius: 8px;
+    color: var(--text-secondary);
+}
+
+/* HOF Notification */
+.hof-notification {
+    margin-top: 20px;
+    padding: 16px;
+    background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+    border-radius: 8px;
+    color: white;
+    text-align: center;
+    font-weight: 600;
+}
+
+.hof-notification a {
+    color: white;
+    text-decoration: underline;
+}
+
+/* Settings Styles */
+.settings-section {
+    margin-top: 20px;
+}
+
+.color-input-group {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin-bottom: 15px;
+}
+
+.color-input-group label {
+    min-width: 150px;
+    font-weight: 500;
+}
+
+.color-input-group input[type="color"] {
+    width: 60px;
+    height: 40px;
+    border: 2px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
 @media (max-width: 768px) {
     header h1 {
         font-size: 2rem;
@@ -447,5 +598,16 @@ header h1 {
     
     .stats-grid {
         grid-template-columns: 1fr;
+    }
+    
+    .airfoil-grid {
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        gap: 12px;
+    }
+    
+    .modal-content {
+        width: 95%;
+        padding: 20px;
+        margin: 5% auto;
     }
 }

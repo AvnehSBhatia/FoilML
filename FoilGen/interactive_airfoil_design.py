@@ -374,15 +374,17 @@ def compute_reynolds_mach(chord_ft, speed_mph):
 
 def bin_reynolds_number(re):
     """
-    Bin Reynolds number into predefined bins: 50k, 100k, 250k, 500k, 750k
+    Bin Reynolds number into predefined bins: 50k, 100k, 250k, 500k, 750k, 1m+
     
     Args:
         re: Reynolds number
     
     Returns:
-        binned_re: Nearest bin value
+        binned_re: Nearest bin value (or 1000000 for 1m+)
     """
     bins = [50000, 100000, 250000, 500000, 750000]
+    if re >= 1000000:
+        return 1000000  # 1m+ bin
     # Find nearest bin
     binned_re = min(bins, key=lambda x: abs(x - re))
     return binned_re
@@ -394,7 +396,7 @@ def get_max_cl_ld_for_re_bin(re_bin):
     This is used for setting graph scaling.
     
     Args:
-        re_bin: Binned Reynolds number (50k, 100k, 250k, 500k, 750k)
+        re_bin: Binned Reynolds number (50k, 100k, 250k, 500k, 750k, 1m+)
     
     Returns:
         max_cl: Maximum Cl value for this Re bin
@@ -408,7 +410,8 @@ def get_max_cl_ld_for_re_bin(re_bin):
         100000: {'max_cl': 1.4, 'max_ld': 100},
         250000: {'max_cl': 1.6, 'max_ld': 120},
         500000: {'max_cl': 1.8, 'max_ld': 140},
-        750000: {'max_cl': 2.0, 'max_ld': 160}
+        750000: {'max_cl': 2.0, 'max_ld': 160},
+        1000000: {'max_cl': 2.2, 'max_ld': 180}  # 1m+ bin
     }
     
     if re_bin in re_bin_ranges:
