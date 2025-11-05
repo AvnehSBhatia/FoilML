@@ -506,55 +506,27 @@ def generate_and_evaluate_airfoil(Re, Mach, alpha, cl_target, cl_cd_target, min_
             nf_ld_arr = np.array(nf_ld_list)
             
             # Compute error: mean squared error between NeuralFoil results and target
-            # with Gaussian weighting around peaks
             valid_mask = ~(np.isnan(nf_cl_arr) | np.isnan(nf_cd_arr))
             if np.sum(valid_mask) > 0:
-                # Get alpha values for valid points
-                alpha_arr = np.array(alpha)
-                alpha_valid = alpha_arr[valid_mask]
-                
                 # Normalize errors by range of target values
                 cl_range = np.max(cl_target) - np.min(cl_target)
                 cl_cd_range = np.max(cl_cd_target) - np.min(cl_cd_target)
                 
-                # Find peaks (alpha where max occurs)
-                cl_peak_idx = np.argmax(cl_target)
-                cl_peak_alpha = alpha_arr[cl_peak_idx]
-                
-                ld_peak_idx = np.argmax(cl_cd_target)
-                ld_peak_alpha = alpha_arr[ld_peak_idx]
-                
-                # Compute Gaussian weights around peaks
-                # Use standard deviation based on alpha range (e.g., 1/4 of total range)
-                alpha_range = np.max(alpha_arr) - np.min(alpha_arr)
-                cl_sigma = alpha_range / 4.0  # Controls width of Gaussian
-                ld_sigma = alpha_range / 4.0
-                
-                # Gaussian weight function: exp(-0.5 * ((x - mu) / sigma)^2)
-                cl_weights = np.exp(-0.5 * ((alpha_valid - cl_peak_alpha) / cl_sigma) ** 2)
-                ld_weights = np.exp(-0.5 * ((alpha_valid - ld_peak_alpha) / ld_sigma) ** 2)
-                
-                # Normalize weights so they sum to number of points (for proper weighting)
-                cl_weights = cl_weights * len(cl_weights) / np.sum(cl_weights)
-                ld_weights = ld_weights * len(ld_weights) / np.sum(ld_weights)
-                
-                # Compute weighted MSE for Cl
+                # Compute squared error for Cl
                 cl_target_valid = cl_target[valid_mask]
                 nf_cl_valid = nf_cl_arr[valid_mask]
                 if cl_range > 0:
-                    cl_errors = ((nf_cl_valid - cl_target_valid) / cl_range) ** 2
+                    cl_error = np.sum(((nf_cl_valid - cl_target_valid) / cl_range) ** 2)
                 else:
-                    cl_errors = (nf_cl_valid - cl_target_valid) ** 2
-                cl_error = np.mean(cl_errors * cl_weights)
+                    cl_error = np.sum((nf_cl_valid - cl_target_valid) ** 2)
                 
-                # Compute weighted MSE for L/D
+                # Compute squared error for L/D
                 nf_ld_valid = nf_ld_arr[valid_mask]
                 cl_cd_target_valid = cl_cd_target[valid_mask]
                 if cl_cd_range > 0:
-                    ld_errors = ((nf_ld_valid - cl_cd_target_valid) / cl_cd_range) ** 2
+                    ld_error = np.sum(((nf_ld_valid - cl_cd_target_valid) / cl_cd_range) ** 2)
                 else:
-                    ld_errors = (nf_ld_valid - cl_cd_target_valid) ** 2
-                ld_error = np.mean(ld_errors * ld_weights)
+                    ld_error = np.sum((nf_ld_valid - cl_cd_target_valid) ** 2)
                 
                 # Weighted combination: 50% Cl, 50% L/D
                 error = 0.5 * cl_error + 0.5 * ld_error
