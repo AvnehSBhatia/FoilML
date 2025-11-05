@@ -209,7 +209,7 @@ class AF512toXYNet(nn.Module):
         return self.network(x)
 
 
-def predict_xy_coordinates(model, af512_data, device='mps'):
+def predict_xy_coordinates(model, af512_data, device='cpu'):
     model.eval()
     with torch.no_grad():
         if af512_data.ndim == 2:
@@ -515,7 +515,7 @@ def normalize_user_features(feature_dict, normalization_data):
     return normalized_features, min_vals, max_vals
 
 
-def run_pipeline(aero_model, af512_to_xy_model, feature_dict, normalization_data, device='mps'):
+def run_pipeline(aero_model, af512_to_xy_model, feature_dict, normalization_data, device='cpu'):
     """
     Run the full pipeline: User inputs → Aero → AF512 → XY coordinates.
     
@@ -1078,15 +1078,10 @@ def get_user_input():
 
 
 def main():
-    # Set device
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
+    # Force CPU-only
+    device = torch.device('cpu')
     
-    print(f"\nUsing device: {device}\n")
+    print(f"\nUsing device: {device} (CPU-only)\n")
     
     # Load models
     aero_model_file = 'aero_to_af512_model.pth'
@@ -1217,7 +1212,7 @@ def main():
         output_size=2048,
         hidden_sizes=[256, 256, 256, 256]
     )
-    af512_to_xy_model.load_state_dict(torch.load(af512_to_xy_model_file, map_location=device))
+    af512_to_xy_model.load_state_dict(torch.load(af512_to_xy_model_file, map_location='cpu'))
     af512_to_xy_model = af512_to_xy_model.to(device)
     print("AF512toXY model loaded successfully\n")
     

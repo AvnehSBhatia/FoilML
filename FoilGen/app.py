@@ -51,15 +51,10 @@ def load_models():
     """Load models once at startup."""
     global aero_model, af512_to_xy_model, normalization_data, device
     
-    # Set device
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
+    # Force CPU-only for deployment
+    device = torch.device('cpu')
     
-    print(f"Loading models on device: {device}")
+    print(f"Loading models on device: {device} (CPU-only)")
     
     # Load AeroToAF512 model
     aero_model_file = 'aero_to_af512_model.pth'
@@ -123,7 +118,7 @@ def load_models():
         raise FileNotFoundError(f"Model file {af512_to_xy_model_file} not found!")
     
     af512_to_xy_model = AF512toXYNet()
-    af512_to_xy_model.load_state_dict(torch.load(af512_to_xy_model_file, map_location=device))
+    af512_to_xy_model.load_state_dict(torch.load(af512_to_xy_model_file, map_location='cpu'))
     af512_to_xy_model = af512_to_xy_model.to(device)
     af512_to_xy_model.eval()
     
