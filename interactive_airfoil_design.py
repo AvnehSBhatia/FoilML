@@ -9,16 +9,6 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import os
 from scipy.interpolate import interp1d, UnivariateSpline
-from train_aero_to_af512 import (
-    normalize_features,
-    AeroToAF512Net,
-    collate_fn
-)
-from train_airfoil import (
-    AF512toXYNet,
-    predict_xy_coordinates,
-    load_dat_file
-)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 try:
@@ -28,6 +18,329 @@ except ImportError:
     NEURALFOIL_AVAILABLE = False
     print("Warning: NeuralFoil not installed. Install with: pip install neuralfoil")
 
+
+# ============================================================================
+# Model and utility definitions (previously imported from train_aero_to_af512 and train_airfoil)
+# ============================================================================
+
+class SequenceEncoder(nn.Module):
+    """LSTM-based sequence encoder for variable-length aerodynamic vectors."""
+    def __init__(self, input_dim=4, hidden_dim=128, num_layers=2, embedding_dim=256):
+        super(SequenceEncoder, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # LSTM encoder
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, bidirectional=True)
+        
+        # Output projection to fixed embedding size
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2, embedding_dim),  # *2 for bidirectional
+            nn.LeakyReLU(),
+            nn.Dropout(0.1)
+        )
+    
+    def forward(self, x, lengths=None):
+        """
+        Args:
+            x: (batch_size, seq_len, input_dim) - variable length sequences (padded)
+            lengths: (batch_size,) - actual lengths of each sequence (can be on any device)
+        
+        Returns:
+            embedding: (batch_size, embedding_dim)
+        """
+        # Pack sequences if lengths provided (requires CPU, but we'll handle it)
+        if lengths is not None:
+            # pack_padded_sequence requires lengths on CPU, so convert temporarily
+            lengths_cpu = lengths.cpu() if lengths.device.type != 'cpu' else lengths
+            x = nn.utils.rnn.pack_padded_sequence(x, lengths_cpu, batch_first=True, enforce_sorted=False)
+        
+        # LSTM encoding
+        lstm_out, (hidden, cell) = self.lstm(x)
+        
+        # Use the last hidden state from both directions
+        # hidden shape: (num_layers * 2, batch_size, hidden_dim) for bidirectional
+        # Take the last layer's forward and backward hidden states
+        forward_hidden = hidden[-2]  # Last forward hidden state
+        backward_hidden = hidden[-1]  # Last backward hidden state
+        combined_hidden = torch.cat([forward_hidden, backward_hidden], dim=1)
+        
+        # Project to fixed embedding size
+        embedding = self.projection(combined_hidden)
+        return embedding
+
+
+class AeroToAF512Net(nn.Module):
+    def __init__(self, scalar_input_size=10, sequence_embedding_dim=256, output_size=1024, 
+                 hidden_sizes=[256, 256, 256, 256]):
+        super(AeroToAF512Net, self).__init__()
+        
+        # Sequence encoder: encodes variable-length [alpha, cl, cd, cl_cd] vectors
+        self.sequence_encoder = SequenceEncoder(
+            input_dim=4,  # alpha, cl, cd, cl_cd
+            hidden_dim=128,
+            num_layers=2,
+            embedding_dim=sequence_embedding_dim
+        )
+        
+        # Combine scalar features + sequence embedding
+        combined_input_size = scalar_input_size + sequence_embedding_dim
+        
+        # Main network
+        layers = []
+        prev_size = combined_input_size
+        
+        for hidden_size in hidden_sizes:
+            layers.extend([
+                nn.Linear(prev_size, hidden_size),
+                nn.LeakyReLU(),
+                nn.Dropout(0.1),
+            ])
+            prev_size = hidden_size
+        
+        layers.append(nn.Linear(prev_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, scalars, sequence, lengths=None):
+        """
+        Args:
+            scalars: (batch_size, scalar_input_size) - Re, Mach, etc.
+            sequence: (batch_size, seq_len, 4) - variable length [alpha, cl, cd, cl_cd] sequences
+            lengths: (batch_size,) - actual lengths of sequences
+        """
+        # Encode sequence to fixed-size embedding
+        seq_embedding = self.sequence_encoder(sequence, lengths)
+        
+        # Concatenate scalar features with sequence embedding
+        combined = torch.cat([scalars, seq_embedding], dim=1)
+        
+        # Pass through main network
+        output = self.network(combined)
+        return output
+
+
+def normalize_features(features_list):
+    """Normalize scalar features to [0, 1] range."""
+    # Extract all scalar features
+    scalars_list = [f['scalars'] for f in features_list]
+    scalars_array = np.array(scalars_list)
+    
+    min_vals = np.min(scalars_array, axis=0, keepdims=True)
+    max_vals = np.max(scalars_array, axis=0, keepdims=True)
+    
+    # Avoid division by zero
+    ranges = max_vals - min_vals
+    ranges[ranges < 1e-6] = 1.0
+    
+    # Normalize scalar features
+    normalized_features = []
+    for feature_dict in features_list:
+        normalized_scalars = (feature_dict['scalars'] - min_vals.flatten()) / ranges.flatten()
+        normalized_features.append({
+            'scalars': normalized_scalars,
+            'sequence': feature_dict['sequence']  # Keep sequences as-is (will be normalized in model)
+        })
+    
+    return normalized_features, min_vals, max_vals
+
+
+def collate_fn(batch):
+    """Custom collate function to handle variable-length sequences."""
+    scalars_list = []
+    sequences_list = []
+    targets_list = []
+    lengths_list = []
+    
+    for item in batch:
+        feature_dict, target = item
+        scalars_list.append(feature_dict['scalars'])
+        sequences_list.append(feature_dict['sequence'])
+        targets_list.append(target)
+        lengths_list.append(len(feature_dict['sequence']))
+    
+    # Pad sequences to same length
+    max_len = max(lengths_list)
+    padded_sequences = []
+    for seq in sequences_list:
+        if len(seq) < max_len:
+            # Pad with zeros
+            pad_len = max_len - len(seq)
+            pad = torch.zeros(pad_len, seq.shape[1])
+            padded_seq = torch.cat([seq, pad], dim=0)
+        else:
+            padded_seq = seq
+        padded_sequences.append(padded_seq)
+    
+    # Stack into batches
+    scalars_batch = torch.stack(scalars_list)
+    sequences_batch = torch.stack(padded_sequences)
+    targets_batch = torch.stack(targets_list)
+    lengths_batch = torch.tensor(lengths_list, dtype=torch.long)
+    
+    return {
+        'scalars': scalars_batch,
+        'sequence': sequences_batch,
+        'lengths': lengths_batch
+    }, targets_batch
+
+
+class AF512toXYNet(nn.Module):
+    
+    def __init__(self, input_size=1024, output_size=2048, hidden_sizes=[256, 256, 256, 256]):
+        super(AF512toXYNet, self).__init__()
+        
+        layers = []
+        prev_size = input_size
+        
+        for hidden_size in hidden_sizes:
+            layers.extend([
+                nn.Linear(prev_size, hidden_size),
+                nn.LeakyReLU(),
+                nn.Dropout(0.1),
+            ])
+            prev_size = hidden_size
+        
+        layers.append(nn.Linear(prev_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x)
+
+
+def predict_xy_coordinates(model, af512_data, device='mps'):
+    model.eval()
+    with torch.no_grad():
+        if af512_data.ndim == 2:
+            af512_flat = af512_data.flatten()
+        else:
+            af512_flat = af512_data
+        
+        input_tensor = torch.FloatTensor(af512_flat).unsqueeze(0).to(device)
+        output = model(input_tensor)
+        xy_flat = output.cpu().numpy().flatten()
+        
+        x_coords = xy_flat[:1024]
+        y_coords = xy_flat[1024:]
+        
+        return x_coords, y_coords
+
+
+def load_dat_file(filepath, num_points=512):
+    """
+    Load airfoil coordinates from a .dat file.
+    Format: First line is name, subsequent lines are x y coordinates.
+    Upper surface goes from trailing edge (x=1) to leading edge (x=0),
+    then lower surface from leading edge back to trailing edge.
+    """
+    try:
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        
+        # Skip the first line (airfoil name)
+        coords = []
+        for line in lines[1:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parts = line.split()
+                if len(parts) >= 2:
+                    x = float(parts[0])
+                    y = float(parts[1])
+                    coords.append((x, y))
+            except ValueError:
+                continue
+        
+        if len(coords) < 10:
+            return None, None
+        
+        coords = np.array(coords)
+        x_coords = coords[:, 0]
+        y_coords = coords[:, 1]
+        
+        # Find the leading edge (minimum x coordinate)
+        # There might be duplicate points at leading edge, so find first occurrence
+        min_x = np.min(x_coords)
+        leading_edge_indices = np.where(np.abs(x_coords - min_x) < 1e-6)[0]
+        
+        if len(leading_edge_indices) == 0:
+            leading_edge_idx = np.argmin(x_coords)
+        else:
+            # Use the middle occurrence if multiple
+            leading_edge_idx = leading_edge_indices[len(leading_edge_indices) // 2]
+        
+        # Split into upper and lower surfaces
+        # Upper surface: from start to leading edge (x goes from ~1 to ~0)
+        # Lower surface: from leading edge to end (x goes from ~0 to ~1)
+        upper_x = x_coords[:leading_edge_idx+1].copy()
+        upper_y = y_coords[:leading_edge_idx+1].copy()
+        lower_x = x_coords[leading_edge_idx:].copy()
+        lower_y = y_coords[leading_edge_idx:].copy()
+        
+        # Reverse upper surface to go from leading edge (x=0) to trailing edge (x=1)
+        upper_x = upper_x[::-1]
+        upper_y = upper_y[::-1]
+        
+        # Normalize x coordinates to [0, 1] range
+        x_min = np.min(x_coords)
+        x_max = np.max(x_coords)
+        if x_max - x_min > 1e-6:
+            upper_x = (upper_x - x_min) / (x_max - x_min)
+            lower_x = (lower_x - x_min) / (x_max - x_min)
+        else:
+            # If all x are the same, create a uniform distribution
+            upper_x = np.linspace(0, 1, len(upper_x))
+            lower_x = np.linspace(0, 1, len(lower_x))
+        
+        # Ensure x coordinates are in [0, 1] range
+        upper_x = np.clip(upper_x, 0, 1)
+        lower_x = np.clip(lower_x, 0, 1)
+        
+        # Sort by x to ensure monotonic increase
+        upper_sort_idx = np.argsort(upper_x)
+        upper_x = upper_x[upper_sort_idx]
+        upper_y = upper_y[upper_sort_idx]
+        
+        lower_sort_idx = np.argsort(lower_x)
+        lower_x = lower_x[lower_sort_idx]
+        lower_y = lower_y[lower_sort_idx]
+        
+        # Remove duplicates in x coordinates
+        upper_x, upper_unique_idx = np.unique(upper_x, return_index=True)
+        upper_y = upper_y[upper_unique_idx]
+        
+        lower_x, lower_unique_idx = np.unique(lower_x, return_index=True)
+        lower_y = lower_y[lower_unique_idx]
+        
+        # Convert to AF512 format
+        x_uniform = np.linspace(0, 1, num_points)
+        
+        # Interpolate upper and lower surfaces
+        if len(upper_x) > 1 and len(lower_x) > 1:
+            upper_interp = interp1d(upper_x, upper_y, kind='linear', bounds_error=False, fill_value='extrapolate')
+            upper_y_uniform = upper_interp(x_uniform)
+            
+            lower_interp = interp1d(lower_x, lower_y, kind='linear', bounds_error=False, fill_value='extrapolate')
+            lower_y_uniform = lower_interp(x_uniform)
+        else:
+            # Fallback if interpolation fails
+            return None, None
+        
+        # Combine: [upper_y, lower_y]
+        af512_data = np.concatenate([upper_y_uniform, lower_y_uniform])
+        
+        return af512_data, (x_uniform, upper_y_uniform, lower_y_uniform)
+    
+    except Exception as e:
+        print(f"Error loading .dat file: {e}")
+        return None, None
+
+
+# ============================================================================
+# Main script functions
+# ============================================================================
 
 def compute_reynolds_mach(chord_ft, speed_mph):
     """
@@ -57,6 +370,56 @@ def compute_reynolds_mach(chord_ft, speed_mph):
     Mach = speed_mps / a
     
     return Re, Mach
+
+
+def bin_reynolds_number(re):
+    """
+    Bin Reynolds number into predefined bins: 50k, 100k, 250k, 500k, 750k
+    
+    Args:
+        re: Reynolds number
+    
+    Returns:
+        binned_re: Nearest bin value
+    """
+    bins = [50000, 100000, 250000, 500000, 750000]
+    # Find nearest bin
+    binned_re = min(bins, key=lambda x: abs(x - re))
+    return binned_re
+
+
+def get_max_cl_ld_for_re_bin(re_bin):
+    """
+    Get maximum Cl and L/D values for a given Reynolds number bin.
+    This is used for setting graph scaling.
+    
+    Args:
+        re_bin: Binned Reynolds number (50k, 100k, 250k, 500k, 750k)
+    
+    Returns:
+        max_cl: Maximum Cl value for this Re bin
+        max_ld: Maximum L/D value for this Re bin
+    """
+    # Typical maximum values for different Reynolds number ranges
+    # These are approximate based on typical airfoil performance
+    # You may want to adjust these based on your data
+    re_bin_ranges = {
+        50000: {'max_cl': 1.2, 'max_ld': 80},
+        100000: {'max_cl': 1.4, 'max_ld': 100},
+        250000: {'max_cl': 1.6, 'max_ld': 120},
+        500000: {'max_cl': 1.8, 'max_ld': 140},
+        750000: {'max_cl': 2.0, 'max_ld': 160}
+    }
+    
+    if re_bin in re_bin_ranges:
+        max_cl = re_bin_ranges[re_bin]['max_cl']
+        max_ld = re_bin_ranges[re_bin]['max_ld']
+    else:
+        # Default values if bin not found
+        max_cl = 1.5
+        max_ld = 100
+    
+    return max_cl, max_ld
 
 
 def create_alpha_vector(a_min, a_max, increment=0.5):
@@ -390,212 +753,178 @@ def run_neuralfoil_comparison(x_coords, y_coords, alpha, cl_input, cd_input, cl_
 
 
 class InteractivePlot:
-    """Interactive matplotlib plot for entering points by clicking."""
-    def __init__(self, title, xlabel, ylabel, alpha_range):
+    """Interactive matplotlib plot for entering points by typing."""
+    def __init__(self, title, xlabel, ylabel, alpha_range, y_max=None, y_min=0):
         self.title = title
         self.xlabel = xlabel
         self.ylabel = ylabel
         self.alpha_range = alpha_range
-        self.points = []  # List of (alpha, value) tuples
-        self.spline_smoothing = 0.0  # Spline smoothing parameter (0 = interpolation, >0 = smoothing)
-        self.zoom_state = None  # Store zoom state (xlim, ylim) when zoomed
+        self.y_max = y_max if y_max is not None else 2.0
+        self.y_min = y_min
         
-        self.fig, self.ax = plt.subplots(figsize=(10, 6))
-        # Enable matplotlib toolbar for zoom/pan (should be enabled by default)
+        # Store control points as list of (alpha, value) tuples
+        self.points = []
         
-        self.ax.set_title(f"{title}\nLeft-click to add points | Right-click to zoom/pan | 'd' to delete | 'c' to clear | 'q' to finish", 
-                         fontsize=11)
-        self.ax.set_xlabel(xlabel)
-        self.ax.set_ylabel(ylabel)
-        self.ax.set_xlim(alpha_range[0] - 1, alpha_range[1] + 1)
-        self.ax.grid(True, alpha=0.3)
-        
-        self.line = None
-        self.point_plot = None
-        self.update_plot()
-        
-        # Connect events - only connect left-click, let matplotlib handle right-click for zoom/pan
-        self.fig.canvas.mpl_connect('button_press_event', self.onclick)
-        self.fig.canvas.mpl_connect('key_press_event', self.onkey)
-        
-        # Store original toolbar
-        self.toolbar = self.fig.canvas.toolbar
-        
-    def onclick(self, event):
-        """Handle mouse clicks."""
-        if event.inaxes != self.ax:
-            return
-        # Only left-click adds points, right-click and middle-click are for zoom/pan
-        if event.button == 1:  # Left click only
-            alpha = event.xdata
-            value = event.ydata
-            self.points.append((alpha, value))
-            # Sort by alpha
-            self.points.sort(key=lambda x: x[0])
-            self.update_plot()
-            self.fig.canvas.draw()
-    
-    def onkey(self, event):
-        """Handle keyboard events."""
-        if event.key == 'd':  # Delete last point
-            if self.points:
-                self.points.pop()
-                self.update_plot()
-                self.fig.canvas.draw()
-        elif event.key == 'c':  # Clear all
-            self.points = []
-            self.update_plot()
-            self.fig.canvas.draw()
-        elif event.key == 'q':  # Quit
-            plt.close(self.fig)
-        elif event.key == 'r':  # Reset view
-            self.zoom_state = None  # Clear zoom state
-            self.ax.set_xlim(self.alpha_range[0] - 1, self.alpha_range[1] + 1)
-            if len(self.points) > 0:
-                values = np.array([p[1] for p in self.points])
-                if len(values) > 0:
-                    y_min, y_max = values.min(), values.max()
-                    y_range = y_max - y_min
-                    if y_range > 0:
-                        padding = y_range * 0.1
-                        self.ax.set_ylim(y_min - padding, y_max + padding)
-            self.fig.canvas.draw()
-    
     def update_plot(self):
-        """Update the plot with current points."""
-        # Store current view limits if zoomed (before clearing)
-        try:
-            current_xlim = self.ax.get_xlim()
-            current_ylim = self.ax.get_ylim()
-            default_xlim = (self.alpha_range[0] - 1, self.alpha_range[1] + 1)
-            # Check if zoomed (not at default view)
-            is_zoomed = (abs(current_xlim[0] - default_xlim[0]) > 0.1 or 
-                        abs(current_xlim[1] - default_xlim[1]) > 0.1)
-            if is_zoomed:
-                self.zoom_state = (current_xlim, current_ylim)
-            else:
-                self.zoom_state = None
-        except:
-            is_zoomed = False
-            # Use stored zoom state if available
-            if self.zoom_state is not None:
-                current_xlim, current_ylim = self.zoom_state
-                is_zoomed = True
-            else:
-                current_xlim = None
-                current_ylim = None
-        
-        self.ax.clear()
-        self.ax.set_title(f"{self.title}\nLeft-click to add points | Right-click to zoom/pan | 'd' to delete | 'c' to clear | 'q' to finish", 
-                         fontsize=11)
-        self.ax.set_xlabel(self.xlabel)
-        self.ax.set_ylabel(self.ylabel)
-        self.ax.grid(True, alpha=0.3)
+        """Update the plot with current points and interpolated curve."""
+        plt.figure(figsize=(12, 8))
+        plt.title(f"{self.title}", fontsize=14, fontweight='bold')
+        plt.xlabel(self.xlabel)
+        plt.ylabel(self.ylabel)
+        plt.grid(True, alpha=0.3)
+        plt.xlim(self.alpha_range[0] - 1, self.alpha_range[1] + 1)
+        plt.ylim(self.y_min, self.y_max * 1.15)
         
         if len(self.points) > 0:
             alphas = np.array([p[0] for p in self.points])
             values = np.array([p[1] for p in self.points])
             
-            # Plot points
-            self.ax.plot(alphas, values, 'bo', markersize=10, label='Control Points', zorder=5)
+            # Plot control points
+            plt.plot(alphas, values, 'bo', markersize=10, label='Control Points', zorder=5)
             
-            # Plot spline interpolation if more than one point
-            if len(self.points) > 1:
-                # Show spline interpolated preview on alpha vector
-                alpha_vec = np.linspace(self.alpha_range[0], self.alpha_range[1], 200)
+            # Plot spline interpolation if we have enough points
+            if len(self.points) >= 2:
+                # Create smooth curve for display
+                smooth_alpha = np.linspace(self.alpha_range[0], self.alpha_range[1], 200)
                 try:
-                    interp_values = self.interpolate(alpha_vec)
-                    self.ax.plot(alpha_vec, interp_values, 'g-', linewidth=2, alpha=0.8, label='Spline Interpolation', zorder=2)
+                    interp_values = self._interpolate_points(smooth_alpha)
+                    plt.plot(smooth_alpha, interp_values, 'g-', linewidth=2, 
+                               alpha=0.8, label='Spline Interpolation', zorder=2)
                 except Exception as e:
                     # Fallback to linear if spline fails
                     try:
-                        from scipy.interpolate import interp1d
-                        interp_func = interp1d(alphas, values, kind='linear', bounds_error=False, fill_value='extrapolate')
-                        interp_values = interp_func(alpha_vec)
-                        self.ax.plot(alpha_vec, interp_values, 'g--', linewidth=2, alpha=0.7, label='Linear Interpolation (fallback)', zorder=2)
+                        interp_func = interp1d(alphas, values, kind='linear', 
+                                              bounds_error=False, fill_value='extrapolate')
+                        interp_values = interp_func(smooth_alpha)
+                        plt.plot(smooth_alpha, interp_values, 'g--', linewidth=2, 
+                                   alpha=0.7, label='Linear Interpolation (fallback)', zorder=2)
                     except:
                         pass
-            
-            # Auto-scale y-axis only if not zoomed
-            if not is_zoomed:
-                if len(values) > 0:
-                    y_min, y_max = values.min(), values.max()
-                    y_range = y_max - y_min
-                    if y_range > 0:
-                        padding = y_range * 0.1
-                        self.ax.set_ylim(y_min - padding, y_max + padding)
-                    else:
-                        self.ax.set_ylim(y_min - 0.1, y_max + 0.1)
-                # Set x-axis limits
-                self.ax.set_xlim(self.alpha_range[0] - 1, self.alpha_range[1] + 1)
-            else:
-                # Restore zoom
-                self.ax.set_xlim(current_xlim)
-                self.ax.set_ylim(current_ylim)
+            elif len(self.points) == 1:
+                # Single point - show horizontal line
+                plt.axhline(y=values[0], color='g', linestyle='--', 
+                               alpha=0.5, label='Constant value', zorder=2)
         
-        else:
-            # Initial view
-            self.ax.set_xlim(self.alpha_range[0] - 1, self.alpha_range[1] + 1)
-        
-        self.ax.legend(loc='best')
+        plt.legend(loc='best')
+        plt.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.1)  # Brief pause to ensure plot updates
     
-    def interpolate(self, alpha_vector):
-        """Interpolate values for given alpha vector using splines."""
+    def _interpolate_points(self, alpha_vector):
+        """Interpolate using control points with splines."""
         if len(self.points) == 0:
-            raise ValueError("No points have been added. Please add at least one point.")
+            raise ValueError("No points defined")
         
         alphas = np.array([p[0] for p in self.points])
         values = np.array([p[1] for p in self.points])
         
-        # Sort by alpha
-        sort_idx = np.argsort(alphas)
-        alphas = alphas[sort_idx]
-        values = values[sort_idx]
-        
         alpha_vector = np.array(alpha_vector)
         
-        # If only one point, return constant value
         if len(self.points) == 1:
             return np.full_like(alpha_vector, values[0])
         
         # Use cubic spline interpolation
-        # s=0 means interpolation (passes through all points)
-        # For smoothing, increase s (e.g., s=len(alphas) for moderate smoothing)
         try:
-            # Try cubic spline first (k=3)
-            spline = UnivariateSpline(alphas, values, s=self.spline_smoothing, k=min(3, len(alphas)-1))
+            spline = UnivariateSpline(alphas, values, s=0, k=min(3, len(alphas)-1))
             interpolated = spline(alpha_vector)
         except:
-            # If cubic fails (e.g., too few points), fall back to linear
+            # Fallback to linear
             interp_func = interp1d(alphas, values, kind='linear', 
                                   bounds_error=False, fill_value='extrapolate')
             interpolated = interp_func(alpha_vector)
         
         return interpolated
     
+    def interpolate(self, alpha_vector):
+        """Interpolate values for given alpha vector using splines."""
+        if len(self.points) == 0:
+            raise ValueError("No points have been added. Please add at least one point.")
+        
+        return self._interpolate_points(alpha_vector)
+    
     def show(self):
-        """Show the plot and wait for user to finish."""
+        """Show the plot and prompt for point input."""
         print(f"\nInteractive plot: {self.title}")
-        print("Instructions:")
-        print("  - Left-click to add points")
-        print("  - Right-click or middle-click to zoom/pan (use toolbar)")
-        print("  - Press 'd' to delete last point")
-        print("  - Press 'c' to clear all points")
-        print("  - Press 'r' to reset zoom")
-        print("  - Press 'q' or close window when done")
-        print(f"  Current points: {len(self.points)}")
-        print("  Using cubic spline interpolation")
+        print(f"  Y-axis range: {self.y_min:.2f} to {self.y_max:.2f}")
+        print(f"  Alpha range: {self.alpha_range[0]:.1f} to {self.alpha_range[1]:.1f}")
+        print("\nEnter points as 'alpha,value' (e.g., '5.0,1.2')")
+        print("  - You don't need to enter all points - spline will interpolate missing ones")
+        print("  - Type 'done' or 'd' when finished")
+        print("  - Type 'clear' or 'c' to clear all points")
+        print("  - Type 'list' or 'l' to see current points")
+        print("  - Type 'plot' or 'p' to update the plot")
+        print("  - Type 'delete <index>' or 'del <index>' to remove a point by index")
+        print()
         
-        # Ensure toolbar is visible for zoom/pan
-        try:
-            # Try to show toolbar (works for most backends)
-            if hasattr(self.fig.canvas, 'toolbar') and self.fig.canvas.toolbar:
-                self.fig.canvas.toolbar.update()
-        except:
-            pass
+        # Show initial empty plot
+        self.update_plot()
         
-        # Use block=True to wait for window to close
-        plt.show(block=True)
+        while True:
+            user_input = input(f"Enter point (alpha,value) or command [{len(self.points)} points so far]: ").strip()
+            
+            if not user_input:
+                continue
+            
+            user_input_lower = user_input.lower()
+            
+            # Check for commands
+            if user_input_lower in ['done', 'd', 'q', 'quit']:
+                if len(self.points) == 0:
+                    print("  Warning: No points entered! Please add at least one point.")
+                    continue
+                break
+            elif user_input_lower in ['clear', 'c']:
+                self.points = []
+                print("  Cleared all points.")
+                self.update_plot()
+            elif user_input_lower in ['list', 'l']:
+                if len(self.points) == 0:
+                    print("  No points yet.")
+                else:
+                    print("  Current points:")
+                    for i, (alpha, value) in enumerate(self.points):
+                        print(f"    [{i}] alpha={alpha:.3f}, value={value:.6f}")
+            elif user_input_lower in ['plot', 'p']:
+                self.update_plot()
+            elif user_input_lower.startswith('delete ') or user_input_lower.startswith('del '):
+                try:
+                    idx_str = user_input_lower.split()[-1]
+                    idx = int(idx_str)
+                    if 0 <= idx < len(self.points):
+                        removed = self.points.pop(idx)
+                        print(f"  Removed point: alpha={removed[0]:.3f}, value={removed[1]:.6f}")
+                        self.update_plot()
+                    else:
+                        print(f"  Error: Index {idx} out of range (0-{len(self.points)-1})")
+                except ValueError:
+                    print("  Error: Invalid index. Use 'delete <index>' or 'del <index>'")
+            else:
+                # Try to parse as alpha,value pair
+                try:
+                    parts = user_input.split(',')
+                    if len(parts) != 2:
+                        raise ValueError("Need exactly two values")
+                    
+                    alpha = float(parts[0].strip())
+                    value = float(parts[1].strip())
+                    
+                    # Check if alpha is in range (optional check)
+                    if alpha < self.alpha_range[0] - 5 or alpha > self.alpha_range[1] + 5:
+                        response = input(f"  Warning: Alpha ({alpha}) is outside typical range [{self.alpha_range[0]}, {self.alpha_range[1]}]. Continue? (y/n): ")
+                        if response.lower() != 'y':
+                            continue
+                    
+                    self.points.append((alpha, value))
+                    # Sort by alpha to keep points ordered
+                    self.points.sort(key=lambda x: x[0])
+                    
+                    print(f"  Added point: alpha={alpha:.3f}, value={value:.6f}")
+                    self.update_plot()
+                    
+                except ValueError as e:
+                    print(f"  Error: Could not parse '{user_input}'. Expected format: 'alpha,value' (e.g., '5.0,1.2')")
+        
+        plt.close('all')  # Close all plots when done
         return self
 
 
@@ -623,27 +952,29 @@ def get_user_input():
     alpha = create_alpha_vector(a_min, a_max, increment)
     print(f"   Generated {len(alpha)} angles from {a_min} to {a_max} deg (increment: {increment})")
     
-    # Get Cl vector using interactive plot
+    # Bin Re for graph scaling (but still use actual Re for calculations)
+    re_bin = bin_reynolds_number(Re)
+    max_cl, max_ld = get_max_cl_ld_for_re_bin(re_bin)
+    print(f"\n   Re bin for graph scaling: {re_bin:.0f}")
+    print(f"   Graph scaling - Max Cl: {max_cl:.2f}, Max L/D: {max_ld:.2f}")
+    
+    # Get Cl vector using interactive plot with Re-binned scaling
     print("\n3. Enter Cl values (lift coefficient) - Interactive Plot")
-    cl_plot = InteractivePlot("Cl vs Angle of Attack", "Angle of Attack (deg)", "Cl", (a_min, a_max))
+    cl_plot = InteractivePlot("Cl vs Angle of Attack", "Angle of Attack (deg)", "Cl", 
+                              (a_min, a_max), y_max=max_cl * 1.15, y_min=0)
     cl_plot.show()
     
-    if len(cl_plot.points) == 0:
-        raise ValueError("No Cl points were added. Please add at least one point.")
-    
     cl = cl_plot.interpolate(alpha)
-    print(f"   Interpolated {len(cl)} Cl values from {len(cl_plot.points)} points")
+    print(f"   Interpolated {len(cl)} Cl values from control points")
     
-    # Get Cl/Cd vector using interactive plot
+    # Get Cl/Cd vector using interactive plot with Re-binned scaling
     print("\n4. Enter Cl/Cd values (lift-to-drag ratio) - Interactive Plot")
-    cl_cd_plot = InteractivePlot("Cl/Cd vs Angle of Attack", "Angle of Attack (deg)", "Cl/Cd", (a_min, a_max))
+    cl_cd_plot = InteractivePlot("Cl/Cd vs Angle of Attack", "Angle of Attack (deg)", "Cl/Cd", 
+                                 (a_min, a_max), y_max=max_ld * 1.15, y_min=0)
     cl_cd_plot.show()
     
-    if len(cl_cd_plot.points) == 0:
-        raise ValueError("No Cl/Cd points were added. Please add at least one point.")
-    
     cl_cd = cl_cd_plot.interpolate(alpha)
-    print(f"   Interpolated {len(cl_cd)} Cl/Cd values from {len(cl_cd_plot.points)} points")
+    print(f"   Interpolated {len(cl_cd)} Cl/Cd values from control points")
     
     # Compute Cd from Cl and Cl/Cd
     cd = compute_cd_from_cl_clcd(cl, cl_cd)
