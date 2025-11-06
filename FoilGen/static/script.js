@@ -611,11 +611,11 @@ async function generateAirfoil() {
         return;
     }
     
-    const maxThicknessMin = parseFloat(document.getElementById('max-thickness-min').value);
-    const maxThicknessMax = parseFloat(document.getElementById('max-thickness-max').value);
+    const minThickness = parseFloat(document.getElementById('min-thickness').value);
+    const maxThickness = parseFloat(document.getElementById('max-thickness').value);
     
-    if (!maxThicknessMin || !maxThicknessMax || maxThicknessMin >= maxThicknessMax) {
-        showError('Please enter valid max thickness range (min < max)');
+    if (!minThickness || !maxThickness || minThickness >= maxThickness) {
+        showError('Please enter valid thickness values (minimum must be less than maximum)');
         return;
     }
     
@@ -647,8 +647,8 @@ async function generateAirfoil() {
                 alpha: state.alpha,
                 cl: state.clInterpolated,
                 cl_cd: state.clCdInterpolated,
-                max_thickness_min: maxThicknessMin,
-                max_thickness_max: maxThicknessMax
+                min_thickness: minThickness,
+                max_thickness: maxThickness
             })
         });
         
@@ -814,8 +814,8 @@ function exportConfig() {
         clcd_points: state.clCdPoints || [],
         cl_interpolated: state.clInterpolated || [],
         clcd_interpolated: state.clCdInterpolated || [],
-        max_thickness_min: parseFloat(document.getElementById('max-thickness-min').value) || 0.1,
-        max_thickness_max: parseFloat(document.getElementById('max-thickness-max').value) || 0.2
+        min_thickness: parseFloat(document.getElementById('min-thickness').value) || 0.05,
+        max_thickness: parseFloat(document.getElementById('max-thickness').value) || 0.15
     };
     
     const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
@@ -843,8 +843,15 @@ async function importConfig(event) {
         if (config.speed_mph) document.getElementById('speed').value = config.speed_mph;
         if (config.alpha_min) document.getElementById('alpha-min').value = config.alpha_min;
         if (config.alpha_max) document.getElementById('alpha-max').value = config.alpha_max;
-        if (config.max_thickness_min) document.getElementById('max-thickness-min').value = config.max_thickness_min;
-        if (config.max_thickness_max) document.getElementById('max-thickness-max').value = config.max_thickness_max;
+        if (config.min_thickness) document.getElementById('min-thickness').value = config.min_thickness;
+        if (config.max_thickness) document.getElementById('max-thickness').value = config.max_thickness;
+        // Handle legacy config format (backward compatibility)
+        if (config.max_thickness_min && !config.min_thickness) {
+            document.getElementById('min-thickness').value = config.max_thickness_min;
+        }
+        if (config.max_thickness_max && !config.max_thickness) {
+            document.getElementById('max-thickness').value = config.max_thickness_max;
+        }
         
         // Load state
         if (config.re) state.re = config.re;

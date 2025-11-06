@@ -828,7 +828,7 @@ def generate_and_evaluate_airfoil(Re, Mach, alpha, cl_target, cl_cd_target, min_
 
 @app.route('/api/optimize_airfoil', methods=['POST'])
 def api_optimize_airfoil():
-    """Optimize airfoil by testing different thickness combinations."""
+    """Generate airfoil with specified min and max thickness values."""
     if aero_model is None or af512_to_xy_model is None:
         return jsonify({'error': 'Models not loaded'}), 500
     
@@ -851,76 +851,31 @@ def api_optimize_airfoil():
             alpha = np.array(data['alpha'])
             cl_target = np.array(data['cl'])
             cl_cd_target = np.array(data['cl_cd'])
-            max_thickness_min = float(data['max_thickness_min'])
-            max_thickness_max = float(data['max_thickness_max'])
+            min_thickness = float(data['min_thickness'])
+            max_thickness = float(data['max_thickness'])
             
-            # Generate max thickness range (0.01 increments)
-            max_thicknesses = np.arange(max_thickness_min, max_thickness_max + 0.005, 0.01)
+            # Validate thickness values
+            if min_thickness >= max_thickness:
+                yield f"data: {json.dumps({'type': 'error', 'error': 'min_thickness must be less than max_thickness'})}\n\n"
+                return
             
-            # Calculate total iterations
-            total_iterations = 0
-            for max_t in max_thicknesses:
-                # For each max thickness, try min thickness from 0.01 to max_t/2
-                min_thicknesses = np.arange(0.01, max_t / 2 + 0.005, 0.01)
-                total_iterations += len(min_thicknesses)
+            # Check for cancellation
+            if optimization_cancelled.get(request_id, False):
+                yield f"data: {json.dumps({'type': 'cancelled', 'message': 'Optimization cancelled by user'})}\n\n"
+                return
             
-            # Track best airfoil
-            best_error = float('inf')
-            best_pred_x = None
-            best_pred_y = None
-            best_nf_cl = None
-            best_nf_cd = None
-            best_nf_ld = None
-            best_airfoil_plot = None
-            best_min_t = None
-            best_max_t = None
+            # Generate and evaluate airfoil
+            try:
+                pred_x, pred_y, nf_cl_arr, nf_cd_arr, nf_ld_arr, error, airfoil_plot = \
+                    generate_and_evaluate_airfoil(
+                        Re, Mach, alpha, cl_target, cl_cd_target, min_thickness, max_thickness
+                    )
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': f'Error generating airfoil: {str(e)}'})}\n\n"
+                return
             
-            current_iteration = 0
-            
-            # Iterate over max thickness
-            for max_t in max_thicknesses:
-                # For each max thickness, try min thickness from 0.01 to max_t/2
-                min_thicknesses = np.arange(0.01, max_t / 2 + 0.005, 0.01)
-                
-                for min_t in min_thicknesses:
-                    # Check for cancellation
-                    if optimization_cancelled.get(request_id, False):
-                        yield f"data: {json.dumps({'type': 'cancelled', 'message': 'Optimization cancelled by user'})}\n\n"
-                        return
-                    
-                    current_iteration += 1
-                    progress = (current_iteration / total_iterations) * 100
-                    
-                    # Generate and evaluate airfoil
-                    try:
-                        pred_x, pred_y, nf_cl_arr, nf_cd_arr, nf_ld_arr, error, airfoil_plot = \
-                            generate_and_evaluate_airfoil(
-                                Re, Mach, alpha, cl_target, cl_cd_target, min_t, max_t
-                            )
-                        
-                        # Update best if this is better
-                        if error < best_error:
-                            best_error = error
-                            best_pred_x = pred_x
-                            best_pred_y = pred_y
-                            best_nf_cl = nf_cl_arr
-                            best_nf_cd = nf_cd_arr
-                            best_nf_ld = nf_ld_arr
-                            best_airfoil_plot = airfoil_plot
-                            best_min_t = min_t
-                            best_max_t = max_t
-                            
-                            # Send progress update with best airfoil
-                            yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'iteration': current_iteration, 'total': total_iterations, 'current_max_t': float(max_t), 'current_min_t': float(min_t), 'best_error': float(best_error), 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t), 'best_airfoil_plot': best_airfoil_plot})}\n\n"
-                        else:
-                            # Send progress update without updating best
-                            yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'iteration': current_iteration, 'total': total_iterations, 'current_max_t': float(max_t), 'current_min_t': float(min_t), 'best_error': float(best_error), 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t)})}\n\n"
-                    except Exception as e:
-                        print(f"Error generating airfoil at max_t={max_t}, min_t={min_t}: {e}")
-                        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'iteration': current_iteration, 'total': total_iterations, 'error': str(e)})}\n\n"
-            
-            # Generate final plots with best airfoil
-            if best_pred_x is not None:
+            # Generate final plots
+            if pred_x is not None:
                 # Aerodynamic curves plot
                 fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                 
@@ -928,10 +883,10 @@ def api_optimize_airfoil():
                 
                 # Cl vs alpha
                 axes[0].plot(alpha_arr, cl_target, 'b-o', label='Target', linewidth=2, markersize=4)
-                if best_nf_cl is not None:
-                    valid_mask = ~np.isnan(best_nf_cl)
+                if nf_cl_arr is not None:
+                    valid_mask = ~np.isnan(nf_cl_arr)
                     if np.sum(valid_mask) > 0:
-                        axes[0].plot(alpha_arr[valid_mask], best_nf_cl[valid_mask], 'r--s', 
+                        axes[0].plot(alpha_arr[valid_mask], nf_cl_arr[valid_mask], 'r--s', 
                                     label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
                 axes[0].set_xlabel('Angle of Attack (deg)')
                 axes[0].set_ylabel('Cl')
@@ -942,10 +897,10 @@ def api_optimize_airfoil():
                 # Cd vs alpha
                 cd_target = compute_cd_from_cl_clcd(cl_target, cl_cd_target)
                 axes[1].plot(alpha_arr, cd_target, 'r-o', label='Target', linewidth=2, markersize=4)
-                if best_nf_cd is not None:
-                    valid_mask = ~np.isnan(best_nf_cd)
+                if nf_cd_arr is not None:
+                    valid_mask = ~np.isnan(nf_cd_arr)
                     if np.sum(valid_mask) > 0:
-                        axes[1].plot(alpha_arr[valid_mask], best_nf_cd[valid_mask], 'b--s', 
+                        axes[1].plot(alpha_arr[valid_mask], nf_cd_arr[valid_mask], 'b--s', 
                                     label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
                 axes[1].set_xlabel('Angle of Attack (deg)')
                 axes[1].set_ylabel('Cd')
@@ -955,10 +910,10 @@ def api_optimize_airfoil():
                 
                 # Cl/Cd vs alpha
                 axes[2].plot(alpha_arr, cl_cd_target, 'g-o', label='Target', linewidth=2, markersize=4)
-                if best_nf_ld is not None:
-                    valid_mask = ~np.isnan(best_nf_ld)
+                if nf_ld_arr is not None:
+                    valid_mask = ~np.isnan(nf_ld_arr)
                     if np.sum(valid_mask) > 0:
-                        axes[2].plot(alpha_arr[valid_mask], best_nf_ld[valid_mask], 'm--s', 
+                        axes[2].plot(alpha_arr[valid_mask], nf_ld_arr[valid_mask], 'm--s', 
                                     label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
                 axes[2].set_xlabel('Angle of Attack (deg)')
                 axes[2].set_ylabel('Cl/Cd')
@@ -975,19 +930,19 @@ def api_optimize_airfoil():
                 
                 # Compute stats from NeuralFoil results
                 nf_stats = None
-                if best_nf_cl is not None and best_nf_cd is not None and best_nf_ld is not None:
-                    valid_mask = ~(np.isnan(best_nf_cl) | np.isnan(best_nf_cd) | np.isnan(best_nf_ld))
+                if nf_cl_arr is not None and nf_cd_arr is not None and nf_ld_arr is not None:
+                    valid_mask = ~(np.isnan(nf_cl_arr) | np.isnan(nf_cd_arr) | np.isnan(nf_ld_arr))
                     if np.sum(valid_mask) > 0:
                         nf_alpha_valid = alpha_arr[valid_mask]
-                        nf_cl_valid = best_nf_cl[valid_mask]
-                        nf_cd_valid = best_nf_cd[valid_mask]
-                        nf_ld_valid = best_nf_ld[valid_mask]
+                        nf_cl_valid = nf_cl_arr[valid_mask]
+                        nf_cd_valid = nf_cd_arr[valid_mask]
+                        nf_ld_valid = nf_ld_arr[valid_mask]
                         nf_stats = compute_summary_statistics(nf_alpha_valid, nf_cl_valid, nf_cd_valid, nf_ld_valid)
                 
                 # Save .dat file with scaled coordinates
                 os.makedirs('output', exist_ok=True)
                 dat_path = os.path.join('output', 'generated_airfoil.dat')
-                scaled_x, scaled_y = scale_dat_coordinates(best_pred_x, best_pred_y)
+                scaled_x, scaled_y = scale_dat_coordinates(pred_x, pred_y)
                 with open(dat_path, 'w') as f:
                     f.write("Generated Airfoil\n")
                     for x, y in zip(scaled_x, scaled_y):
@@ -1004,14 +959,14 @@ def api_optimize_airfoil():
                     
                     if hof_qualifies_ld or hof_qualifies_cl:
                         hof_added_ld, hof_added_cl = add_to_hof(
-                            re_bin, nf_stats, best_pred_x, best_pred_y,
-                            best_airfoil_plot, curves_plot_b64,
-                            alpha, best_nf_cl, best_nf_cd, best_nf_ld,
-                            best_min_t, best_max_t
+                            re_bin, nf_stats, pred_x, pred_y,
+                            airfoil_plot, curves_plot_b64,
+                            alpha, nf_cl_arr, nf_cd_arr, nf_ld_arr,
+                            min_thickness, max_thickness
                         )
                 
                 # Send final result
-                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'x_coords': best_pred_x.tolist(), 'y_coords': best_pred_y.tolist(), 'stats': {k: float(v) for k, v in (nf_stats or {}).items()}, 'plots': {'airfoil_shape': best_airfoil_plot, 'aerodynamic_curves': curves_plot_b64}, 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t), 'best_error': float(best_error), 'hof_added_ld': hof_added_ld, 'hof_added_cl': hof_added_cl})}\n\n"
+                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'x_coords': pred_x.tolist(), 'y_coords': pred_y.tolist(), 'stats': {k: float(v) for k, v in (nf_stats or {}).items()}, 'plots': {'airfoil_shape': airfoil_plot, 'aerodynamic_curves': curves_plot_b64}, 'max_thickness': float(max_thickness), 'min_thickness': float(min_thickness), 'error': float(error), 'hof_added_ld': hof_added_ld, 'hof_added_cl': hof_added_cl})}\n\n"
             else:
                 yield f"data: {json.dumps({'type': 'complete', 'success': False, 'error': 'No valid airfoil generated'})}\n\n"
         
@@ -1061,8 +1016,8 @@ def api_export_config():
             'clcd_points': data.get('clcd_points', []),
             'cl_interpolated': data.get('cl_interpolated', []),
             'clcd_interpolated': data.get('clcd_interpolated', []),
-            'max_thickness_min': float(data.get('max_thickness_min', 0.1)),
-            'max_thickness_max': float(data.get('max_thickness_max', 0.2))
+            'min_thickness': float(data.get('min_thickness', 0.01)),
+            'max_thickness': float(data.get('max_thickness', 0.15))
         }
         
         # Create response with JSON download
@@ -1101,8 +1056,8 @@ def api_import_config():
             'clcd_points': config.get('clcd_points', []),
             'cl_interpolated': config.get('cl_interpolated', []),
             'clcd_interpolated': config.get('clcd_interpolated', []),
-            'max_thickness_min': float(config.get('max_thickness_min', 0.1)),
-            'max_thickness_max': float(config.get('max_thickness_max', 0.2))
+            'min_thickness': float(config.get('min_thickness', 0.01)),
+            'max_thickness': float(config.get('max_thickness', 0.15))
         }
         
         return jsonify({'success': True, 'config': validated_config})
