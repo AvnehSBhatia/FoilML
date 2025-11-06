@@ -210,21 +210,34 @@ class AF512toXYNet(nn.Module):
 
 
 def predict_xy_coordinates(model, af512_data, device='cpu'):
+    """Predict XY coordinates from AF512 representation (optimized for inference)."""
     model.eval()
-    with torch.no_grad():
+    # Disable gradient computation for faster inference
+    torch.set_grad_enabled(False)
+    try:
         if af512_data.ndim == 2:
             af512_flat = af512_data.flatten()
         else:
             af512_flat = af512_data
         
-        input_tensor = torch.FloatTensor(af512_flat).unsqueeze(0).to(device)
+        # Use contiguous tensor for better memory access patterns
+        input_tensor = torch.FloatTensor(af512_flat).unsqueeze(0).contiguous().to(device)
         output = model(input_tensor)
-        xy_flat = output.cpu().numpy().flatten()
+        
+        # Handle both quantized and regular models (quantized models auto-dequantize)
+        if isinstance(output, torch.Tensor):
+            xy_flat = output.cpu().numpy().flatten()
+        else:
+            # Fallback for unexpected output types
+            xy_flat = np.array(output).flatten()
         
         x_coords = xy_flat[:1024]
         y_coords = xy_flat[1024:]
         
         return x_coords, y_coords
+    finally:
+        # Re-enable gradients (in case other code needs them)
+        torch.set_grad_enabled(True)
 
 
 def load_dat_file(filepath, num_points=512):
@@ -521,6 +534,7 @@ def normalize_user_features(feature_dict, normalization_data):
 def run_pipeline(aero_model, af512_to_xy_model, feature_dict, normalization_data, device='cpu'):
     """
     Run the full pipeline: User inputs → Aero → AF512 → XY coordinates.
+    Optimized for fast inference on small hardware.
     
     Returns:
         pred_x, pred_y: Predicted airfoil coordinates
@@ -528,16 +542,26 @@ def run_pipeline(aero_model, af512_to_xy_model, feature_dict, normalization_data
     # Normalize features
     normalized_features, min_vals, max_vals = normalize_user_features(feature_dict, normalization_data)
     
-    # Convert to tensors
-    scalars_tensor = torch.FloatTensor(normalized_features['scalars']).unsqueeze(0).to(device)
-    sequence_tensor = torch.FloatTensor(normalized_features['sequence']).unsqueeze(0).to(device)
+    # Convert to tensors with contiguous memory layout for better performance
+    scalars_tensor = torch.FloatTensor(normalized_features['scalars']).unsqueeze(0).contiguous().to(device)
+    sequence_tensor = torch.FloatTensor(normalized_features['sequence']).unsqueeze(0).contiguous().to(device)
     lengths_tensor = torch.tensor([len(normalized_features['sequence'])], dtype=torch.long).to(device)
     
     # Step 1: Aero → AF512
     aero_model.eval()
-    with torch.no_grad():
+    # Disable gradient computation globally for faster inference
+    torch.set_grad_enabled(False)
+    try:
         pred_af512_tensor = aero_model(scalars_tensor, sequence_tensor, lengths_tensor)
-        pred_af512_flat = pred_af512_tensor.cpu().numpy().flatten()
+        
+        # Handle both quantized and regular models
+        if isinstance(pred_af512_tensor, torch.Tensor):
+            pred_af512_flat = pred_af512_tensor.cpu().numpy().flatten()
+        else:
+            pred_af512_flat = np.array(pred_af512_tensor).flatten()
+    finally:
+        # Re-enable gradients for other code
+        torch.set_grad_enabled(True)
     
     # Step 2: AF512 → XY
     pred_x, pred_y = predict_xy_coordinates(af512_to_xy_model, pred_af512_flat, device=device)

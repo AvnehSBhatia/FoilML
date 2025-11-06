@@ -75,11 +75,18 @@ MAX_HOF_ENTRIES = 10  # Top 10 per category
 optimization_cancelled = {}  # Track cancelled optimizations by request ID
 
 def load_models():
-    """Load models once at startup."""
+    """Load models once at startup with optimizations for small hardware."""
     global aero_model, af512_to_xy_model, normalization_data, device
     
     # Force CPU-only for deployment
     device = torch.device('cpu')
+    
+    # Optimize CPU settings for inference
+    # Set number of threads for optimal performance (use all available, but limit to avoid overhead)
+    num_threads = min(torch.get_num_threads(), 4)  # Limit to 4 threads for small hardware
+    torch.set_num_threads(num_threads)
+    torch.set_num_interop_threads(1)  # Use single inter-op thread for better latency
+    print(f"Optimized CPU threads: {torch.get_num_threads()} compute threads, 1 inter-op thread")
     
     print(f"Loading models on device: {device} (CPU-only)")
     
@@ -139,6 +146,20 @@ def load_models():
     aero_model = aero_model.to(device)
     aero_model.eval()
     
+    # Apply dynamic quantization to AeroToAF512 model
+    # Quantization reduces memory usage by ~4x and speeds up inference by 2-4x on CPU
+    # Note: LSTM layers won't be quantized, only Linear layers
+    print("Applying dynamic quantization to AeroToAF512 model...")
+    try:
+        aero_model = torch.quantization.quantize_dynamic(
+            aero_model, 
+            {nn.Linear},  # Only quantize Linear layers (LSTM stays float32)
+            dtype=torch.qint8
+        )
+        print("✓ AeroToAF512 model quantized successfully")
+    except Exception as e:
+        print(f"⚠ Warning: Quantization failed for AeroToAF512 ({e}), continuing without quantization")
+    
     # Load AF512toXY model
     af512_to_xy_model_file = 'af512_to_xy_model.pth'
     if not os.path.exists(af512_to_xy_model_file):
@@ -149,6 +170,42 @@ def load_models():
     af512_to_xy_model = af512_to_xy_model.to(device)
     af512_to_xy_model.eval()
     
+    # Apply dynamic quantization to AF512toXY model FIRST
+    # This gives the biggest performance boost (2-4x speedup)
+    print("Applying dynamic quantization to AF512toXY model...")
+    quantization_applied = False
+    try:
+        af512_to_xy_model = torch.quantization.quantize_dynamic(
+            af512_to_xy_model,
+            {nn.Linear},
+            dtype=torch.qint8
+        )
+        quantization_applied = True
+        print("✓ AF512toXY model quantized successfully")
+    except Exception as e:
+        print(f"⚠ Quantization failed for AF512toXY ({e}), continuing without quantization")
+    
+    # Try to compile quantized AF512toXY model with TorchScript for additional speedup
+    # TorchScript can provide 10-30% additional speedup on top of quantization
+    if quantization_applied:
+        print("Attempting to compile quantized AF512toXY model with TorchScript...")
+        try:
+            # Create a dummy input for tracing
+            dummy_af512 = torch.randn(1, 1024)
+            with torch.no_grad():
+                # Trace the quantized model
+                af512_to_xy_model_traced = torch.jit.trace(af512_to_xy_model, dummy_af512)
+                af512_to_xy_model_traced.eval()
+                # Test the traced model
+                _ = af512_to_xy_model_traced(dummy_af512)
+            af512_to_xy_model = af512_to_xy_model_traced
+            print("✓ AF512toXY model compiled with TorchScript (quantized + traced)")
+        except Exception as e:
+            print(f"⚠ TorchScript tracing failed for AF512toXY ({e}), using quantized model without tracing")
+    
+    # Note: AeroToAF512 contains LSTM which is difficult to trace with TorchScript
+    # The quantization already provides significant speedup for the Linear layers
+    
     # Load normalization data
     norm_file = 'feature_normalization.npy'
     if not os.path.exists(norm_file):
@@ -157,7 +214,7 @@ def load_models():
     norm_dict = np.load(norm_file, allow_pickle=True).item()
     normalization_data = norm_dict
     
-    print("Models loaded successfully!")
+    print("✓ Models loaded and optimized successfully!")
 
 # Load models on startup
 try:
